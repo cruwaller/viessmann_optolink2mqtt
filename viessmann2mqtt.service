@@ -1,0 +1,12 @@
+[Unit]
+Description=Viessmann to MQTT
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=
+ExecStart=/opt/viessmann_optolink2mqtt/viessmann_optolink_mqtt --broker 127.0.0.1 --vcd_host 127.0.0.1 --vcd_port 30080  -v -v -v
+
+[Install]
+WantedBy=multi-user.target
