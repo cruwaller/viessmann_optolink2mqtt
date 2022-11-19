@@ -98,6 +98,30 @@ class VitoElementTemperature(HassSensor):
         return (self.get_topic(), self.value)
 
 
+class VitoElementPercent(HassSensor):
+    def __init__(self, name: str, cmd: str, telnet: telnetlib.Telnet) -> None:
+        super().__init__(name, DEVICE, topic_parent_level=cmd,
+                         device_class="", unit_of_measurement="%",
+                         state_class="measurement")
+        self.conn = VitoConnection(telnet, cmd)
+
+    @property
+    def value(self) -> None:
+        val = self.conn.query()
+        resp = re.search(r"(*\d+).*", val)
+        if resp:
+            return "%d%%" % int(resp.group(1))
+        self.error_count +=1
+        return None
+
+    @value.setter
+    def value(self, value):
+        raise ValueError("Does not support set value!")
+
+    def value_with_topic(self):
+        return (self.get_topic(), self.value)
+
+
 class VitoElementNumber(HassSensor):
     def __init__(self, name: str, cmd: str, telnet: telnetlib.Telnet,
                  slope: bool = False) -> None:
@@ -208,6 +232,7 @@ class VControldClient(ClientBase):
             VitoElementBinary("Pump, secondary", "SecondaryPump", telnet),
             VitoElementBinary("Pump, DHW", "DHWPump", telnet),
             VitoElementBinary("Pump, DHW circulation", "DHWCirculationPump", telnet),
+            VitoElementPercent("Pump, DHW PWM", "DHW-LoadPumpPwm", telnet),
 
             # Diagnostic
             VitoElementNumber("Heating Curve Slope", "HeatingCurveSlope", telnet, slope=True),
