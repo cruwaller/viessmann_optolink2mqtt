@@ -108,9 +108,9 @@ class VitoElementPercent(HassSensor):
     @property
     def value(self) -> None:
         val = self.conn.query()
-        resp = re.search(r"(*\d+).*", val)
+        resp = re.search(r"(-*\d+\.\d+).*", val)
         if resp:
-            return "%d%%" % int(resp.group(1))
+            return "%d" % int(float(resp.group(1)))
         self.error_count +=1
         return None
 
@@ -216,6 +216,7 @@ class VControldClient(ClientBase):
         self.sensors = [
             # Sensors
             VitoElementTemperature("Water top temperature", "DHW-TopTemp", telnet),
+            VitoElementTemperature("Water bottom temperature", "DHW-BottomTemp", telnet),
             VitoElementTemperature("Outdoor temperature", "TempOutdoor", telnet),
             VitoElementTemperature("Room temperature, party", "RoomTempPartyMode", telnet),
             VitoElementTemperature("Room temperature, reduced, ", "RoomTempReduced", telnet),
