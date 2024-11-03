@@ -1,0 +1,3 @@
+[flake8]
+exclude = .git,venv,venv_new
+max-line-length = 120

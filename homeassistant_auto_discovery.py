@@ -30,7 +30,7 @@ class HassComponent:
     def __init__(self, component: str, name: str, device: HassDevice,
                  device_class: str, unit_of_measurement: str, icon: str,
                  force_update: bool, topic_parent_level: str, state_class: str,
-                 category: str, options: list = None, cmd: bool = False):
+                 category: str, cmd: bool = False):
         self.topic_parent_level = topic_parent_level
         self.discovery_prefix = device.discovery_prefix
         self.component = component  # sensor, binary_sensor, switch...
@@ -61,8 +61,6 @@ class HassComponent:
             config["state_class"] = state_class
         if icon:
             config["icon"] = icon
-        if options:
-            config["options"] = options
         self.config = config
         self.topic = topic
         self.set_category(category)
@@ -89,11 +87,23 @@ class HassComponent:
     def get_topic_set(self) -> str:
         return f"{self.topic}/set" if "cmd_t" in self.config else ""
 
+    @classmethod
+    def get_writeable_properties(cls):
+        return [attr for attr, value in vars(cls).items()
+                if isinstance(value, property) and value.fset is not None]
+
+    @classmethod
+    def is_writable(cls) -> bool:
+        """
+        Returns true if value property has setter
+        """
+        return vars(cls).get("value").fset is not None
+
 
 class HassSensor(HassComponent):
     def __init__(self, name, parent_device, unit_of_measurement=None,
                  icon=None, topic_parent_level="", force_update=False,
-                 device_class = None, state_class=None, category=None):
+                 device_class=None, state_class=None, category=None):
         super().__init__("sensor", name, parent_device, device_class,
                          unit_of_measurement, icon, force_update,
                          topic_parent_level, state_class, category)
@@ -108,11 +118,28 @@ class HassBinarySensor(HassComponent):
                          topic_parent_level, None, category)
 
 
+class HassNumber(HassComponent):
+    def __init__(self, name, parent_device, unit_of_measurement=None,
+                 icon=None, topic_parent_level="", force_update=False,
+                 device_class=None, state_class=None, category=None,
+                 min=None, max=None, mode="box"):
+        super().__init__("number", name, parent_device, device_class,
+                         unit_of_measurement, icon, force_update,
+                         topic_parent_level, state_class, category,
+                         cmd=True)
+        self.config["mode"] = mode
+        if min is not None:
+            self.config["min"] = min
+        if max is not None:
+            self.config["max"] = max
+
+
 class HassSelect(HassComponent):
     def __init__(self, name, parent_device, options,
                  icon=None, topic_parent_level="", force_update=False,
                  category=None, cmd=False):
         super().__init__("select", name, parent_device, None,
                          None, icon, force_update,
-                         topic_parent_level, None, category,
-                         options=options, cmd=cmd)
+                         topic_parent_level, None, category, cmd=cmd)
+        if options:
+            self.config["options"] = options

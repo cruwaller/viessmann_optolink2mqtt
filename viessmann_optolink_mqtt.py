@@ -1,18 +1,18 @@
 import sys
 import time
-from datetime import timedelta, datetime
 import telnetlib
 import re
 import argparse
 import logging
-import json
 import socket
 import paho.mqtt.client as mqtt
+from threading import Lock
 
 from __version import __version__
 from homeassistant_auto_discovery import (
     HassDevice,
     HassSensor, HassBinarySensor, HassSelect,
+    HassNumber,
 )
 
 # 192.168.1.250:30080
@@ -28,32 +28,51 @@ class VitoConnection(object):
     def __init__(self, telnet: telnetlib.Telnet, cmd: str) -> None:
         self.telnet_client = telnet
         self.cmd = cmd
+        self.__lock = Lock()
 
     def set_telnet_client(self, telnet):
         self.telnet_client = telnet
 
-    def read(self, until: str) -> str:
+    def __read(self, until: str) -> str:
         if isinstance(until, str):
             until = str.encode(until)
         _resp = self.telnet_client.read_until(until, timeout=10).decode().strip()
         return _resp.replace("vctrld>", "")  # remove possible vcontrold cli "header"
 
-    def read_line(self) -> str:
-        return self.read('\n')
+    def __read_line(self) -> str:
+        return self.__read('\n')
 
-    def send(self, cmd: str = None) -> None:
+    def __send(self, cmd: str = None, value: str = None) -> None:
         if not isinstance(cmd, str):
             raise ValueError("command must be string")
+        if value is not None:
+            if not isinstance(cmd, str):
+                raise ValueError("value must be a string")
+            cmd = f"set-{cmd} {value}"
         self.telnet_client.write(str.encode(cmd + '\n'))
 
     def query(self) -> str:
         if not self.cmd:
             return
-        # self.read("vctrld>")
+        self.__lock.acquire()
+        # self.__read("vctrld>")
         self.telnet_client.read_very_eager()
-        self.send(self.cmd)
-        resp = self.read_line()
+        self.__send(self.cmd)
+        resp = self.__read_line()
+        self.__lock.release()
         return resp
+
+    def set_value(self, value: str):
+        if not self.cmd:
+            return
+        self.__lock.acquire()
+        # self.__read("vctrld>")
+        self.telnet_client.read_very_eager()
+        self.__send(self.cmd, value)
+        resp = self.__read_line()
+        self.__lock.release()
+        if "OK" not in resp:
+            raise ValueError(f"Unable to write the value {value}: '{resp}'")
 
 
 class VitoElementBinary(HassBinarySensor):
@@ -65,10 +84,6 @@ class VitoElementBinary(HassBinarySensor):
     def value(self) -> None:
         val = self.conn.query()
         return ["ON", "OFF"][val in ["0", "Off"]]
-
-    @value.setter
-    def value(self, value):
-        raise ValueError("Does not support set value!")
 
     def value_with_topic(self):
         return (self.get_topic(), self.value)
@@ -87,12 +102,43 @@ class VitoElementTemperature(HassSensor):
         resp = re.search(r"(-*\d+\.\d+).*", val)
         if resp:
             return "%.1f" % float(resp.group(1))
-        self.error_count +=1
+        self.error_count += 1
         return None
 
-    @value.setter
-    def value(self, value):
-        raise ValueError("Does not support set value!")
+    def value_with_topic(self):
+        return (self.get_topic(), self.value)
+
+
+class VitoElementTemperatureWritable(HassNumber):
+    def __init__(self, name: str, cmd: str, telnet: telnetlib.Telnet,
+                 min: int, max: int) -> None:
+        super().__init__(name, DEVICE, topic_parent_level=cmd,
+                         device_class="temperature", unit_of_measurement="°C",
+                         state_class="measurement", min=min, max=max)
+        self.conn = VitoConnection(telnet, cmd)
+        self.current_value = None
+
+    @property
+    def value(self) -> None:
+        val = self.conn.query()
+        resp = re.search(r"(-*\d+\.\d+).*", val)
+        if resp:
+            _val = float(resp.group(1))
+            self.current_value = _val
+            return "%.1f" % _val
+        self.error_count += 1
+        return None
+
+    def set_value(self, value: str):
+        LOG.info(f"{self.name}: set_value called with arg: '{value}'")
+        if not value.isnumeric():
+            return
+        value = int(value)
+        if self.current_value is None or value == self.current_value:
+            return
+        self.conn.set_value(value)
+        self.current_value = value
+        LOG.info(f"{self.name}: value written successfully")
 
     def value_with_topic(self):
         return (self.get_topic(), self.value)
@@ -111,12 +157,8 @@ class VitoElementPercent(HassSensor):
         resp = re.search(r"(-*\d+\.\d+).*", val)
         if resp:
             return "%d" % int(float(resp.group(1)))
-        self.error_count +=1
+        self.error_count += 1
         return None
-
-    @value.setter
-    def value(self, value):
-        raise ValueError("Does not support set value!")
 
     def value_with_topic(self):
         return (self.get_topic(), self.value)
@@ -136,12 +178,8 @@ class VitoElementNumber(HassSensor):
         resp = re.search(r"(-*\d+\.\d+).*", val)
         if resp:
             return "%.1f" % float(resp.group(1))
-        self.error_count +=1
+        self.error_count += 1
         return None
-
-    @value.setter
-    def value(self, value):
-        raise ValueError("Does not support set value!")
 
     def value_with_topic(self):
         return (self.get_topic(), self.value)
@@ -149,27 +187,32 @@ class VitoElementNumber(HassSensor):
 
 class VitoElementSelect(HassSelect):
     def __init__(self, name: str, cmd: str, telnet: telnetlib.Telnet,
-                 options: dict = {}, write: bool = False) -> None:
+                 options: dict = {}) -> None:
         super().__init__(name, DEVICE, topic_parent_level=cmd,
                          category="config", options=list(options.keys()), cmd=True)
         self.conn = VitoConnection(telnet, cmd)
         self.options: dict = options
+        self.current_value = None
 
     @property
     def value(self) -> None:
         val = self.conn.query()
         for key, value in self.options.items():
             if value == val:
+                self.current_value = key
                 return key
-        self.error_count +=1
+        self.error_count += 1
         return ""
 
-    @value.setter
-    def value(self, val):
-        for key, value in self.options.items():
-            if key == val:
-                LOG.info(f"{self.name}: new value {value}")
-                # TODO: implement send to pump!
+    def set_value(self, value: str):
+        _new_val = self.options.get(value)
+        if _new_val is None:
+            LOG.error(f"{self.name}: Invalid value '{value}'")
+            return
+        LOG.info(f"{self.name}: set_value called with arg: '{value}' -> {_new_val}")
+        if _new_val != self.current_value:
+            self.conn.set_value(_new_val)
+            self.current_value = _new_val
 
     def value_with_topic(self):
         return (self.get_topic(), self.value)
@@ -183,17 +226,14 @@ class VitoElementText():
     def value(self) -> None:
         return self.conn.query()
 
-    @value.setter
-    def value(self, value):
-        raise ValueError("Does not support set value!")
-
 
 class VitoElementTextWrite(VitoElementText):
-    @VitoElementText.value.setter
-    def value(self, value) -> None:
-        if not isinstance(value, str):
-            raise ValueError("Only string is supported")
-        # TODO: write text...
+    pass
+    # @VitoElementText.value.setter
+    # def value(self, value) -> None:
+    #     if not isinstance(value, str):
+    #         raise ValueError("Only string is supported")
+    #     # TODO: write text...
 
 
 class ClientBase(object):
@@ -220,14 +260,16 @@ class VControldClient(ClientBase):
             VitoElementTemperature("Outdoor temperature", "TempOutdoor", telnet),
             VitoElementTemperature("Room temperature, party", "RoomTempPartyMode", telnet),
             VitoElementTemperature("Room temperature, reduced, ", "RoomTempReduced", telnet),
-            VitoElementTemperature("Room temperature, normal", "RoomTempNormal", telnet),
+            VitoElementTemperatureWritable("Room temperature, normal", "RoomTempNormal", telnet, 14, 20),
             VitoElementTemperature("Heating", "Heating", telnet),
             VitoElementTemperature("Circuit temperature, primary, flow", "PrimaryCircuitFlowTemp", telnet),
             VitoElementTemperature("Circuit temperature, primary, return", "PrimaryCircuitReturnTemp", telnet),
             VitoElementTemperature("Circuit temperature, secondary, flow", "SecondaryCircuitFlowTemp", telnet),
             VitoElementTemperature("Circuit temperature, secondary, return", "SecondaryCircuitReturnTemp", telnet),
-            VitoElementTemperature("DHW Setpoint Normal", "DHW-Setpoint", telnet),
-            VitoElementTemperature("DHW Setpoint High", "DHW-Setpoint2", telnet),
+            VitoElementTemperatureWritable("DHW Setpoint Normal", "DHW-Setpoint", telnet, 20, 60),
+            VitoElementTemperatureWritable("DHW Setpoint High", "DHW-Setpoint2", telnet, 20, 60),
+            VitoElementTemperatureWritable("DHW Heat Pump Hysteresis", "DHW-HeatPumpHysteresis", telnet, 1, 60),
+            VitoElementTemperatureWritable("DHW Booster Hysteresis", "DHW-BoosterHysteresis", telnet, 1, 60),
             VitoElementBinary("Compressor", "Compressor", telnet),
             VitoElementBinary("Pump, primary", "PrimaryPump", telnet),
             VitoElementBinary("Pump, secondary", "SecondaryPump", telnet),
@@ -250,7 +292,7 @@ class VControldClient(ClientBase):
                                "Normal": "Continuous Normal",
                                "Standby": "Standby",
                                "Shutdown": "Shutdown",
-                              }, True),
+                               }),
         ]
         self._vito_device = VitoElementText("DeviceType", self.telnet_client)
         self.__connect_telnet_client()
@@ -289,9 +331,17 @@ class VControldClient(ClientBase):
         self.logger.info(f"Connected to device: {model}")
 
     def connected(self, mqtt: mqtt.Client, availability_topic: str = "") -> str:
+        """
+        Called when MQTT gets connected. Purpose is to publish configuration topics
+        and register write topics
+        """
         for sensor in self.sensors:
             config = sensor.get_config(availability_topic)
-            mqtt.publish(*config, retain=True)
+            mqtt.publish(*config, retain=False)
+            _set_topic = sensor.get_topic_set()
+            _cb = getattr(sensor, "set_value", None)
+            if _set_topic and _cb:
+                mqtt.register_subscription(_set_topic, _cb)
             # self.logger.debug(f"Publish: {config}")
 
     def run(self, mqtt) -> list:
@@ -302,7 +352,7 @@ class VControldClient(ClientBase):
             return  # Will reschedule soon...
         for sensor in self.sensors:
             update = sensor.value_with_topic()
-            mqtt.publish(*update, retain=True)
+            mqtt.publish(*update, retain=False)
             # self.logger.debug(f"Publish: {update}")
 
 
@@ -315,6 +365,7 @@ class MqttClient(mqtt.Client):
         super().__init__(client_id=client_id, transport=transport,
                          reconnect_on_failure=reconnect_on_failure)
         self._clients: ClientBase = []
+        self._subscriptions = {}
 
         self.prefix = prefix
         self.interval = interval
@@ -333,6 +384,31 @@ class MqttClient(mqtt.Client):
         if client not in self._clients:
             self._clients.append(client)
 
+    def register_subscription(self, topic: str, cb, qos: int = 1):
+        if not callable(cb):
+            LOG.error(f"Trying to register topic '{topic}' for not callable!")
+            return
+        if topic not in self._subscriptions:
+            self._subscriptions[topic] = cb
+            self.subscribe(topic, qos=qos)
+
+    def __force_update_received(self, msg: str):
+        if msg.lower() == 'true':
+            LOG.info('MQTT received: Forced update triggered')
+            self.run_clients()
+
+    def __update_interval_received(self, msg: str):
+        if msg.isnumeric():
+            __newInterval = int(msg)
+            # TODO: range check...MQTT-Server
+            self.interval = __newInterval
+            LOG.info('MQTT received: Interval updated: %ds' % __newInterval)
+        else:
+            LOG.error(f'MQTT received: Interval is not a number: {msg}')
+        # publish new/old value
+        self.publish(topic=f'{self.cfg_topic_prefix}/updateInterval_s', qos=1, retain=True,
+                     payload=self.interval)
+
     def __on_connect_callback(self, mqttc, obj, flags, rc):
         del mqttc  # unused
         del obj  # unused
@@ -342,13 +418,14 @@ class MqttClient(mqtt.Client):
             LOG.info('Connected to MQTT broker')
             # Subscribe for topis
             topic = f'{self.cfg_topic_prefix}/forcedUpdate_write'
-            self.subscribe(topic, qos=2)
+            self.register_subscription(topic, self.__force_update_received, qos=2)
 
             topic = f'{self.cfg_topic_prefix}/updateInterval_s'
-            self.publish(topic=topic, qos=1, retain=True,
-                            payload=self.interval)
-            self.subscribe(topic + '_write', qos=1)
+            self.publish(topic=topic, qos=1, retain=True, payload=self.interval)
+            self.register_subscription(topic + '_write', self.__update_interval_received)
+
             self.set_connected(True)
+            time.sleep(0.2)
             self.run_clients()
         elif rc == 1:
             LOG.error('Could not connect (%d): incorrect protocol version', rc)
@@ -399,39 +476,43 @@ class MqttClient(mqtt.Client):
         del obj  # unused
         if len(msg.payload) == 0:
             LOG.debug('MQTT: ignoring empty message')
-        elif msg.topic == f'{self.cfg_topic_prefix}/forcedUpdate_write':
-            if msg.payload.lower() == b'True'.lower():
-                LOG.info('MQTT received: Forced update triggered')
-                self.run_clients()
-        elif msg.topic == f'{self.cfg_topic_prefix}/updateInterval_s_write':
-            if str(msg.payload.decode()).isnumeric():
-                newInterval = int(msg.payload)
-                # TODO: range check...MQTT-Server
-                self.interval = newInterval
-                LOG.info('MQTT received: Interval updated: %ds' % newInterval)
-            else:
-                LOG.error(f'MQTT received: Interval is not a number: {msg.payload.decode()}')
-            # publish new/old value
-            self.publish(topic=f'{self.cfg_topic_prefix}/updateInterval_s', qos=1, retain=True,
-                         payload=self.interval)
-        else:
-            if msg.topic.startswith(self.prefix):
-                address = msg.topic[len(self.prefix):]
-                if address.endswith('_write'):
-                    address = address[:-len('_write')]
-                    LOG.info(f"MQTT received. Address '{address}'")
-                    # TODO handle write commands
+            return
+
+        _topic = msg.topic
+        if isinstance(_topic, bytes):
+            _topic = _topic.decode("utf-8")
+        if not isinstance(_topic, str):
+            LOG.error(f"Unable to handle topic '{_topic}', type {type(_topic)}")
+            return
+
+        _payload = msg.payload
+        if isinstance(_payload, bytes):
+            _payload = _payload.decode("utf-8")
+        if not isinstance(_payload, str):
+            LOG.error(f"Unable to handle topic '{_topic}' payload '{_payload}' , type {type(_payload)}")
+            return
+
+        _cb_func = self._subscriptions.get(_topic, None)
+        if _cb_func is not None:
+            try:
+                _cb_func(_payload)
+            except ValueError as err:
+                LOG.error(f"Value set failed! {err}")
+            return
+
+        LOG.warning(f"Unknown message received: {_topic} {_payload}")
 
     def disconnect(self, reasoncode=None, properties=None):
         try:
             self.publish(topic=self.availability_topic, qos=1, retain=True,
-                         payload="offline") #.wait_for_publish()
+                         payload="offline")  # .wait_for_publish()
         except RuntimeError:
             pass
         super().disconnect(reasoncode, properties)
 
     def set_connected(self, connected: bool):
         if connected != self.connected:
+            self._subscriptions = {}
             for client in self._clients:
                 client.connected(self)
             self.publish(topic=self.availability_topic, qos=1, retain=True,
@@ -445,7 +526,8 @@ class MqttClient(mqtt.Client):
                 time.sleep(self.interval)
                 self.run_clients()
         except KeyboardInterrupt:
-            self.loop_stop(force=False)
+            LOG.info(" ... stopping ...")
+            self.loop_stop()
         except VControldClient.ConnectionFailure:
             LOG.error("VControld: connection failure. Restart...")
             raise self.RestartRequired("vcontrold connection error")
@@ -502,9 +584,9 @@ def main():
                             required=False)
 
     optolink_group = parser.add_argument_group('Optolink')
-    mqtt_group.add_argument('--vcd_host', type=str, help='vcontrold telnet host address', required=True)
-    mqtt_group.add_argument('--vcd_port', default=3002, type=NumberRangeArgument(1, 65535),
-                            help='vcontrold telnet host port', required=False)
+    optolink_group.add_argument('--vcd_host', type=str, help='vcontrold telnet host address', required=True)
+    optolink_group.add_argument('--vcd_port', default=3002, type=NumberRangeArgument(1, 65535),
+                                help='vcontrold telnet host port', required=False)
 
     log_group = parser.add_argument_group('Logging')
     log_group.add_argument('-v', '--verbose', action='count', default=1,
