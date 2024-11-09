@@ -337,7 +337,8 @@ class VControldClient(ClientBase):
         """
         for sensor in self.sensors:
             config = sensor.get_config(availability_topic)
-            mqtt.publish(*config, retain=False)
+            # retain config
+            mqtt.publish(*config, retain=True)
             _set_topic = sensor.get_topic_set()
             _cb = getattr(sensor, "set_value", None)
             if _set_topic and _cb:
@@ -406,7 +407,7 @@ class MqttClient(mqtt.Client):
         else:
             LOG.error(f'MQTT received: Interval is not a number: {msg}')
         # publish new/old value
-        self.publish(topic=f'{self.cfg_topic_prefix}/updateInterval_s', qos=1, retain=True,
+        self.publish(topic=f'{self.cfg_topic_prefix}/updateInterval_s', qos=1, retain=False,
                      payload=self.interval)
 
     def __on_connect_callback(self, mqttc, obj, flags, rc):
